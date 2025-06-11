@@ -6,3 +6,4 @@ pypdf
 google-generativeai
 python-multipart
 fastapi-cors
+firebase-admin
