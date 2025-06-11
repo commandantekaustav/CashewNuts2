@@ -48,7 +48,7 @@ app = FastAPI()
 # IMPORTANT: Adjust origins if you deploy to a custom domain
 origins = [
     "http://localhost:3000",  # Default React dev server
-    # e.g., "https://your-frontend-app.onrender.com"
+    "https://cashewnuts2.netlify.app"
 ]
 
 app.add_middleware(
