@@ -1,0 +1,5 @@
+# backend/.gitignore
+.env
+__pycache__/
+*.pyc
+firebase-service-account.json

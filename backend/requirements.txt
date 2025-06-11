@@ -1,0 +1,8 @@
+# backend/requirements.txt
+fastapi
+uvicorn[standard]
+python-dotenv
+pypdf
+google-generativeai
+python-multipart
+fastapi-cors
