@@ -1,6 +1,7 @@
-# backend/main.py
 import os
 import json
+import re
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pypdf
 import google.generativeai as genai
@@ -9,62 +10,42 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# NEW: Import firebase_admin for authentication
 import firebase_admin
 from firebase_admin import credentials, auth
 
-# Load environment variables from a .env file for the Gemini API Key
 load_dotenv()
 
 # --- Firebase Admin SDK Initialization ---
-# This section initializes the connection to your Firebase project
-# It looks for the service account key file in the same directory.
 try:
     cred = credentials.Certificate("firebase-service-account.json")
-    firebase_admin.initialize_app(cred)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
 except Exception as e:
-    print(f"CRITICAL: Error initializing Firebase Admin SDK: {e}")
-    print("Ensure 'firebase-service-account.json' is in the 'backend' directory.")
+    print(f"CRITICAL: Error initializing Firebase: {e}")
     exit()
 
-
 # --- Gemini Configuration ---
-# This section configures the Gemini API with your secret key
 try:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY not found in .env file")
+        raise ValueError("GEMINI_API_KEY not found")
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     print(f"CRITICAL: Error configuring Gemini: {e}")
-    print("Ensure your .env file contains a valid GEMINI_API_KEY.")
     exit()
 
-
-# --- FastAPI App Initialization & CORS Configuration ---
-# This creates the main application instance and allows the frontend to communicate with it.
+# --- FastAPI App & CORS ---
 app = FastAPI()
-
-# IMPORTANT: Adjust origins if you deploy to a custom domain
 origins = [
-    "http://localhost:3000",  # Default React dev server
+    "http://localhost:3000",
     "https://cashewnuts2.netlify.app"
 ]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 # --- Gemini Prompt Templates ---
-
-# Prompt for the initial, main analysis of the resume against a job description.
 prompt_initial_analysis = """
-You are an expert AI recruitment assistant. Your task is to analyze a candidate's resume against a specific job description and produce a comprehensive interview kit.
+You are an expert AI assistant acting as a highly critical, unbiased, Senior Staff Engineer conducting a pre-screen analysis. Your standards are exceptionally high. Your goal is to rigorously evaluate a candidate's resume against a job description.
 
 **Job Description:**
 \"\"\"
@@ -76,79 +57,66 @@ You are an expert AI recruitment assistant. Your task is to analyze a candidate'
 {resume_text}
 \"\"\"
 
-**Instructions:**
-Generate a single, valid JSON object as the output. Do not include any text or markdown formatting like ```json.
-The JSON object must have the following structure:
+**Your Directives:**
+1.  **Find Red Flags (Non-Date Related):** Scrutinize the resume for potential red flags like vague project descriptions, skill claims not supported by experience, or conflicting technical statements. **Do NOT analyze employment dates for overlaps or gaps; this will be handled separately.**
+2.  **Be Unbiased:** Base your analysis strictly on the text provided.
+3.  **Difficulty Level:** Generate questions with an average difficulty targeted at **{difficulty} out of 5**.
+4.  **Output Format:** Generate a single, valid JSON object with no other text or markdown.
+
+**JSON Structure:**
 {{
-  "candidateName": "The candidate's full name, if found, otherwise 'Not Found'",
-  "alignmentSummary": {{
-    "summaryText": "A 2-3 sentence summary of how well the candidate's experience aligns with the job description.",
-    "strengths": ["List of key strengths that match the job role."],
-    "potentialGaps": ["List of potential gaps or areas not explicitly mentioned in the resume."]
+  "candidateName": "The candidate's full name.",
+  "confidenceScore": {{
+    "score": <A number from 1-100 representing your confidence in this candidate's fit for the role>,
+    "justification": "A brief, critical justification for your score."
   }},
+  "potentialInconsistencies": [
+      "A potential non-date-related inconsistency or red flag found in the resume."
+  ],
+  "projectNames": ["A list of project names found in the resume"],
   "categorizedQuestions": {{
-    "Skill Match": [
-        {{
-          "question": "A question directly related to a skill mentioned in the job description AND the resume.",
-          "difficulty": <number 1-5>,
-          "expectedAnswer": "A detailed, ideal answer for this question.",
-          "keywords": ["keywords", "to", "listen", "for", "in the candidate's answer"],
-          "nonTechnicalExplanation": "A simple, non-technical explanation of the core concept being tested."
-        }}
-    ],
-    "Behavioral": [
-        {{
-          "question": "A behavioral question to assess teamwork or problem-solving.",
-          "difficulty": <number 1-5>,
-          "expectedAnswer": "A detailed, ideal answer for this question, outlining a positive behavior.",
-          "keywords": ["teamwork", "communication", "problem-solving"],
-          "nonTechnicalExplanation": "This question assesses the candidate's soft skills and past behavior in a professional setting."
-        }}
-    ],
-    "Project Experience": [
-        {{
-          "question": "A question about a specific project listed on the resume.",
-          "difficulty": <number 1-5>,
-          "expectedAnswer": "A detailed answer where the candidate explains their specific role and the outcome of the project.",
-          "keywords": ["my role", "outcome", "challenge", "solution"],
-          "nonTechnicalExplanation": "This verifies the candidate's actual experience and depth of involvement in their listed projects."
-        }}
+    "Core Technical Skills": [
+      {{
+        "question": "A deep, specific question about a core technology.",
+        "difficulty": <number 1-5>,
+        "expectedAnswer": "A detailed, ideal answer demonstrating true expertise.",
+        "keywords": ["keywords", "to", "listen", "for"],
+        "nonTechnicalExplanation": "For the HR partner: This question tests..."
+      }}
     ]
   }}
 }}
 """
 
-# Prompt for the deep-dive analysis focusing on projects and inconsistencies.
-prompt_deep_dive = """
-You are a senior technical interviewer conducting a deep-dive analysis of a candidate's resume. Your goal is to scrutinize their project experience, identify potential inconsistencies, and formulate highly specific, challenging questions.
+prompt_project_drilldown = """
+You are a technical interviewer drilling down on a specific project from a candidate's resume. Your goal is to ask sharp, insightful questions to validate their claimed experience.
 
-**Candidate's Resume Text:**
+**Project Name:** "{project_name}"
+
+**Full Resume Text:**
 \"\"\"
 {resume_text}
 \"\"\"
 
 **Instructions:**
-Generate a single, valid JSON object. Do not include any text outside the JSON object.
-The JSON object must have the following structure:
+Generate a single, valid JSON object containing an array of 3-4 highly specific questions about the chosen project.
+
+**JSON Structure:**
 {{
-  "projectAnalyses": [
-    {{
-      "projectName": "Name of a specific project from the resume.",
-      "analysis": "A critical analysis of the project description. Mention the technologies used and what the candidate's claimed contribution was.",
-      "pinPointedQuestion": "A highly specific, pin-pointed technical question about this project to verify their depth of knowledge. e.g., 'In your project X, you mentioned using FastAPI; what was the most complex middleware you had to write and why?'"
-    }}
-  ],
-  "potentialInconsistencies": [
-      "A potential inconsistency or vague claim found in the resume, e.g., 'Claims expertise in 'big data' but projects only show small-scale data handling.'",
-      "Another point that requires clarification, e.g., 'Timeline for Project A and Project B appears to overlap.'"
-  ]
+    "projectQuestions": [
+        {{
+          "question": "A very specific question about their contribution to the '{project_name}' project.",
+          "difficulty": <number 3-5>,
+          "expectedAnswer": "A convincing answer would detail the problem, the methodology for finding it, the solution implemented, and how the result was measured.",
+          "keywords": ["bottleneck", "profiling", "trade-offs", "metrics", "my role"],
+          "nonTechnicalExplanation": "For the HR partner: This question cuts through generic claims and forces the candidate to prove their specific, hands-on contribution to the project."
+        }}
+    ]
 }}
 """
 
-
-# --- Helper Function for PDF Parsing ---
+# --- Helper Functions and Auth ---
 def extract_pdf_text(file_stream):
-    """Extracts text from a PDF file stream."""
     try:
         pdf_reader = pypdf.PdfReader(file_stream)
         text = ""
@@ -156,110 +124,112 @@ def extract_pdf_text(file_stream):
             text += page.extract_text()
         return text
     except Exception as e:
-        # This will be caught by the endpoint's try/except block
         raise ValueError(f"Error reading PDF: {e}")
 
+def analyze_work_history(text):
+    date_pattern = re.compile(
+        r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{4})\s*–\s*(Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})\b',
+        re.IGNORECASE
+    )
+    month_map = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+    }
+    found_ranges = []
+    for match in date_pattern.finditer(text):
+        try:
+            start_month_str, start_year_str, end_str = match.groups()
+            start_month = month_map[start_month_str.lower()[:3]]
+            start_year = int(start_year_str)
+            start_date = datetime(start_year, start_month, 1)
+            end_date = None
+            if end_str.lower() == 'present':
+                end_date = datetime.now()
+            else:
+                end_month_str, end_year_str = end_str.split()
+                end_month = month_map[end_month_str.lower()[:3]]
+                end_year = int(end_year_str)
+                end_date = datetime(end_year, end_month, 1)
+            if start_date and end_date:
+                found_ranges.append({"start": start_date, "end": end_date, "text": match.group(0)})
+        except (ValueError, KeyError):
+            continue
+    if not found_ranges:
+        return {"overlaps": [], "gaps": []}
+    sorted_ranges = sorted(found_ranges, key=lambda x: x['start'])
+    overlaps = []
+    gaps = []
+    for i in range(len(sorted_ranges) - 1):
+        current_job = sorted_ranges[i]
+        next_job = sorted_ranges[i+1]
+        if current_job['end'] > next_job['start']:
+            overlaps.append(f"Overlap detected: '{current_job['text']}' and '{next_job['text']}'")
+        gap_duration = next_job['start'] - current_job['end']
+        if gap_duration > timedelta(days=90):
+            gap_months = round(gap_duration.days / 30)
+            gaps.append(f"Potential {gap_months}-month gap found between '{current_job['text']}' and '{next_job['text']}'")
+    return {"overlaps": overlaps, "gaps": gaps}
 
-# --- Authentication Dependency ---
-# This function will be run before any protected endpoint.
-# It checks the "Authorization: Bearer <token>" header.
 token_auth_scheme = HTTPBearer()
-
 def get_current_user(cred: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
-    """
-    A dependency that verifies the Firebase ID token from the Authorization header
-    and returns the user's info. If the token is invalid, it raises an HTTP 401
-    Unauthorized error, and the endpoint code will not be executed.
-    """
-    if not cred:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Bearer token not provided",
-        )
     try:
-        # Verify the token against the Firebase project
         decoded_token = auth.verify_id_token(cred.credentials)
         return decoded_token
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid authentication credentials: {e}",
-        )
-
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid credentials: {e}")
 
 # --- API Endpoints ---
-
 @app.get("/")
-def read_root():
-    """A simple public endpoint to check if the API is running."""
-    return {"message": "Resume Analyzer API is running."}
-
+def read_root(): return {"message": "Resume Analyzer API is running."}
 
 @app.post("/analyze-resume/")
-async def analyze_resume(
-    user: dict = Depends(get_current_user), # This protects the endpoint
-    file: UploadFile = File(...),
-    job_description: str = Form(...)
-):
-    """
-    Receives a resume PDF and job description, analyzes them with Gemini,
-    and returns a structured JSON interview kit. Requires authentication.
-    """
-    print(f"Request received from authenticated user: {user['uid']}")
+async def analyze_resume(user: dict = Depends(get_current_user), file: UploadFile = File(...), job_description: str = Form(...), difficulty: int = Form(...)):
     if not file.content_type == "application/pdf":
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
-
+        raise HTTPException(status_code=400, detail="Please upload a PDF.")
     try:
         resume_text = extract_pdf_text(file.file)
-        if not resume_text:
-            raise HTTPException(status_code=400, detail="Could not extract text from the PDF.")
-
+        date_analysis_results = analyze_work_history(resume_text)
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = prompt_initial_analysis.format(
-            resume_text=resume_text,
-            job_description=job_description
-        )
+        prompt = prompt_initial_analysis.format(resume_text=resume_text, job_description=job_description, difficulty=difficulty)
         response = model.generate_content(prompt)
-
-        # Clean the response and parse it as JSON
         cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
         json_response = json.loads(cleaned_response)
-
-        # Add the raw resume text to the response so the frontend can use it for the deep dive
+        json_response["dateAnalysis"] = date_analysis_results
         json_response["rawResumeText"] = resume_text
-        
+        json_response["jobDescription"] = job_description
         return json_response
-
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to parse Gemini's response as JSON.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
-
-class DeepDiveRequest(BaseModel):
-    """Defines the expected request body for the deep-dive endpoint."""
+class ProjectDrilldownRequest(BaseModel):
     resume_text: str
+    project_name: str
 
-
-@app.post("/deep-dive-analysis/")
-async def deep_dive_analysis(
-    request: DeepDiveRequest,
-    user: dict = Depends(get_current_user) # This protects the endpoint
-):
-    """
-    Receives raw resume text and performs a deep-dive analysis using Gemini.
-    Requires authentication.
-    """
-    print(f"Deep dive request received from authenticated user: {user['uid']}")
+@app.post("/project-questions/")
+async def get_project_questions(request: ProjectDrilldownRequest, user: dict = Depends(get_current_user)):
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = prompt_deep_dive.format(resume_text=request.resume_text)
+        prompt = prompt_project_drilldown.format(resume_text=request.resume_text, project_name=request.project_name)
         response = model.generate_content(prompt)
         cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
         json_response = json.loads(cleaned_response)
         return json_response
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to parse deep dive response from Gemini as JSON.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during deep dive: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during project drill-down: {e}")
 
+class RegenerateRequest(BaseModel):
+    resume_text: str
+    job_description: str
+    difficulty: int
+
+@app.post("/regenerate-questions/")
+async def regenerate_questions(request: RegenerateRequest, user: dict = Depends(get_current_user)):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = prompt_initial_analysis.format(resume_text=request.resume_text, job_description=request.job_description, difficulty=request.difficulty)
+        response = model.generate_content(prompt)
+        cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+        json_response = json.loads(cleaned_response)
+        return {"categorizedQuestions": json_response.get("categorizedQuestions", {})}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error during question regeneration: {e}")
